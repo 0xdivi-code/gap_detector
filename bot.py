@@ -5,27 +5,26 @@ from datetime import datetime, timedelta
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# ============ GOOGLE SHEETS AUTH FROM ENV ============
-
+# ============ AUTH GOOGLE SHEETS ============
 def auth_gsheet():
     creds_json = os.getenv("GOOGLE_CREDS_JSON")
-    creds_file = "temp-creds.json"
-    with open(creds_file, "w") as f:
+    with open("temp-creds.json", "w") as f:
         f.write(creds_json)
 
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    credentials = ServiceAccountCredentials.from_json_keyfile_name(creds_file, scope)
-    return gspread.authorize(credentials)
+    creds = ServiceAccountCredentials.from_json_keyfile_name("temp-creds.json", scope)
+    return gspread.authorize(creds)
 
 sheet_client = auth_gsheet()
-gap_sheet = sheet_client.open("Forex_Gap_Logger").worksheet("Sheet1")
 
-# Create separate sheet for Order Blocks (Sheet2)
+gap_sheet = sheet_client.open("Forex_Gap_Logger").worksheet("Sheet1")
 try:
     ob_sheet = sheet_client.open("Forex_Gap_Logger").worksheet("Order_Blocks")
 except:
-    ob_sheet = sheet_client.open("Forex_Gap_Logger").add_worksheet(title="Order_Blocks", rows="1000", cols="10")
-    ob_sheet.append_row(["Timestamp", "Pair", "TF", "Type", "Zone Low", "Zone High", "Base Candle Time", "Chart URL"])
+    ob_sheet = sheet_client.open("Forex_Gap_Logger").add_worksheet("Order_Blocks", rows="1000", cols="10")
+    ob_sheet.append_row([
+        "Timestamp", "Pair", "TF", "Type", "Zone Low", "Zone High", "Base Candle Time", "Chart URL", "Outcome"
+    ])
 
 # ============ CONFIG ============
 TD_API_KEY = os.getenv("TD_API_KEY")
@@ -86,6 +85,7 @@ def check_gap(pair, tf):
     rsi_str = f"{rsi:.1f}" if rsi else "N/A"
     chart_url = build_chart_url(pair, tf)
 
+    suggestion = ""
     if direction == "GAP UP":
         suggestion = "Overbought GAP UP. Consider SHORT." if rsi and rsi > 70 else "GAP UP. Wait for structure."
     else:
@@ -100,98 +100,125 @@ def check_gap(pair, tf):
 """
     send_to_telegram(msg.strip())
 
-    time_now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    gap_sheet.append_row([time_now, pair, tf, f"{gap_pips:.1f}", rsi_str, direction, suggestion, "Pending", chart_url])
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    gap_sheet.append_row([timestamp, pair, tf, f"{gap_pips:.1f}", rsi_str, direction, suggestion, "Pending", chart_url])
 
 # ============ GAP OUTCOME UPDATE ============
 
 def update_outcomes():
-    records = gap_sheet.get_all_records()
-    for idx, r in enumerate(records, start=2):
+    entries = gap_sheet.get_all_records()
+    for i, r in enumerate(entries, start=2):
         if r["Outcome"] != "Pending":
             continue
+        created = datetime.strptime(r["Timestamp"], "%Y-%m-%d %H:%M:%S")
+        age = (datetime.utcnow() - created).total_seconds()
+        tf = r["TF"]
+        if tf == "4h" and age < 6*3600: continue
+        if tf == "1day" and age < 48*3600: continue
 
         pair = r["Pair"]
-        tf = r["TF"]
-        gap_pips = float(r["Gap (pips)"])
         direction = r["Direction"]
-        base_time = datetime.strptime(r["Timestamp"], "%Y-%m-%d %H:%M:%S")
-        age = (datetime.utcnow() - base_time).total_seconds()
-        wait_time = 6*3600 if tf == "4h" else 24*3600
-        if age < wait_time:
-            continue
-
+        gap_pips = float(r["Gap (pips)"])
         candles = get_candles(pair, tf, 1)
-        if not candles: continue
+        if len(candles) < 1: continue
 
-        close = float(candles[0]['close'])
-        open_price = float(candles[0]['open'])
-        pip_value = 0.0001 if "JPY" not in pair else 0.01
+        close = float(candles[0]["close"])
+        open_price = float(candles[0]["open"])
+        pip_val = 0.0001 if "JPY" not in pair else 0.01
 
-        if direction == "GAP UP" and close <= open_price - gap_pips * pip_value:
-            gap_sheet.update_cell(idx, 8, "Filled ✅")
-        elif direction == "GAP DOWN" and close >= open_price + gap_pips * pip_value:
-            gap_sheet.update_cell(idx, 8, "Filled ✅")
-        else:
-            gap_sheet.update_cell(idx, 8, "Not Filled ❌")
+        fill = False
+        if direction == "GAP UP" and close <= open_price - gap_pips * pip_val:
+            fill = True
+        if direction == "GAP DOWN" and close >= open_price + gap_pips * pip_val:
+            fill = True
 
-# ============ ORDER BLOCK DETECTOR ============
+        outcome = "Filled ✅" if fill else "Not Filled ❌"
+        gap_sheet.update_cell(i, 8, outcome)
+
+# ============ ORDER BLOCK DETECTION ============
 
 def detect_orderblock(pair, tf):
     candles = get_candles(pair, tf, 5)
-    if len(candles) < 4:
+    if len(candles) < 3:
         return
-    
-    # Use 2nd last candle as the "base" candle
-    c1 = candles[2]  # base candle
+
+    base = candles[2]
     c2 = candles[1]
     c3 = candles[0]
-
     chart_url = build_chart_url(pair, tf)
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Buy Order Block (Demand Zone)
-    if float(c1['close']) < float(c1['open']):  # bearish base candle
+    # BUY OB
+    if float(base['close']) < float(base['open']):
         if float(c2['close']) > float(c2['open']) and float(c3['close']) > float(c2['close']):
-            zone_low = float(c1["low"])
-            zone_high = float(c1["high"])
+            zl = float(base['low'])
+            zh = float(base['high'])
             msg = f"""
 📦 BUY ORDER BLOCK DETECTED
 📍 {pair} | {tf.upper()}
-📌 Zone: {zone_low:.4f} - {zone_high:.4f}
-🕒 Base Candle: {c1['datetime']}
+📌 Zone: {zl:.4f} – {zh:.4f}
+📅 {base['datetime']}
 🔗 {chart_url}
 """
             send_to_telegram(msg.strip())
-            ob_sheet.append_row([
-                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                pair, tf, "Buy OB", zone_low, zone_high, c1['datetime'], chart_url
-            ])
+            ob_sheet.append_row([now, pair, tf, "Buy OB", zl, zh, base['datetime'], chart_url, "Pending"])
 
-    # Sell Order Block (Supply Zone)
-    if float(c1['close']) > float(c1['open']):  # bullish base candle
+    # SELL OB
+    if float(base['close']) > float(base['open']):
         if float(c2['close']) < float(c2['open']) and float(c3['close']) < float(c2['close']):
-            zone_low = float(c1["low"])
-            zone_high = float(c1["high"])
+            zl = float(base['low'])
+            zh = float(base['high'])
             msg = f"""
 📦 SELL ORDER BLOCK DETECTED
 📍 {pair} | {tf.upper()}
-📌 Zone: {zone_low:.4f} - {zone_high:.4f}
-🕒 Base Candle: {c1['datetime']}
+📌 Zone: {zl:.4f} – {zh:.4f}
+📅 {base['datetime']}
 🔗 {chart_url}
 """
             send_to_telegram(msg.strip())
-            ob_sheet.append_row([
-                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                pair, tf, "Sell OB", zone_low, zone_high, c1['datetime'], chart_url
-            ])
+            ob_sheet.append_row([now, pair, tf, "Sell OB", zl, zh, base['datetime'], chart_url, "Pending"])
 
-# ============ MAIN RUN LOOP ============
+# ============ ORDER BLOCK OUTCOME TRACKING ============
 
+def update_orderblock_outcomes():
+    rows = ob_sheet.get_all_records()
+    for i, r in enumerate(rows, start=2):
+        if r["Outcome"] not in ["Pending", ""]:
+            continue
+        created = datetime.strptime(r["Timestamp"], "%Y-%m-%d %H:%M:%S")
+        tf = r["TF"]
+        age = (datetime.utcnow() - created).total_seconds()
+        if tf == "4h" and age < 6*3600: continue
+        if tf == "1day" and age < 48*3600: continue
+
+        pair = r["Pair"]
+        zl = float(r["Zone Low"])
+        zh = float(r["Zone High"])
+        ob_type = r["Type"]
+        outcome = "Pending"
+
+        candles = get_candles(pair, tf, 1)
+        if len(candles) < 1: continue
+        price = float(candles[0]["close"])
+
+        if zl <= price <= zh:
+            outcome = "Respected ✅"
+        elif ob_type == "Buy OB" and price < zl:
+            outcome = "Invalidated ❌"
+        elif ob_type == "Sell OB" and price > zh:
+            outcome = "Invalidated ❌"
+
+        ob_sheet.update_cell(i, 9, outcome)
+        if outcome != "Pending":
+            send_to_telegram(f"📈 OB {outcome} – {ob_type} [{pair} {tf.upper()}]")
+
+# ============ MAIN RUN ============
 def run_bot():
     for pair in PAIR_LIST:
         for tf in TF_MAP:
             check_gap(pair, tf)
             detect_orderblock(pair, tf)
     update_outcomes()
+    update_orderblock_outcomes()
 
 run_bot()
